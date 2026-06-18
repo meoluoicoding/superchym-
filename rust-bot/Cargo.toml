@@ -1,0 +1,16 @@
+[package]
+name = "mushroom_bot"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "mushroom_bot"
+path = "src/main.rs"
+
+[dependencies]
+lazy_static = "1"
+
+[features]
+default = []
+embedded_data = []
+online_judge = []
