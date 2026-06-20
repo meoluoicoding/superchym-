@@ -12,6 +12,8 @@ const DB_SECTION_FINGERPRINTS: u32 = 1;
 const DB_SECTION_CENTROIDS: u32 = 2;
 const DB_SECTION_PRIOR_CONFIGS: u32 = 3;
 const DB_SECTION_METADATA: u32 = 4;
+const DB_SECTION_MQUALITY: u32 = 5;
+const DB_SECTION_GEOMETRY: u32 = 6;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug)]
@@ -219,6 +221,25 @@ impl OpponentDB {
                 }
                 DB_SECTION_CENTROIDS | DB_SECTION_METADATA => {
                     // Reserved
+                }
+                DB_SECTION_MQUALITY => {
+                    if sec.data_size as usize >= ROWS * COLS {
+                        let mut grid = [[0i8; COLS]; ROWS];
+                        for r in 0..ROWS {
+                            for c in 0..COLS {
+                                grid[r][c] = sec_data[r * COLS + c] as i8;
+                            }
+                        }
+                        crate::mquality::set_mquality(grid);
+                    }
+                }
+                DB_SECTION_GEOMETRY => {
+                    if sec.data_size as usize >= std::mem::size_of::<GeometryConfig>() {
+                        let cfg: GeometryConfig = unsafe {
+                            std::ptr::read_unaligned(sec_data.as_ptr() as *const GeometryConfig)
+                        };
+                        crate::mquality::set_geometry(cfg);
+                    }
                 }
                 _ => {}
             }

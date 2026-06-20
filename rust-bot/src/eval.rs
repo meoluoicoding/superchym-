@@ -80,7 +80,7 @@ fn get_weights() -> &'static EvalWeightSet {
                 connectivity: 19,
                 corners: 18,
                 edges: 3,
-                recapture: 45,      // increased from 39 — slight steal emphasis
+                recapture: 39,
                 vulnerability: 9,
             },
             second: EvalWeights {
@@ -89,7 +89,7 @@ fn get_weights() -> &'static EvalWeightSet {
                 connectivity: 28,
                 corners: 20,
                 edges: 6,
-                recapture: 35,      // increased from 28 — slight steal emphasis
+                recapture: 28,
                 vulnerability: 18,
             },
         }

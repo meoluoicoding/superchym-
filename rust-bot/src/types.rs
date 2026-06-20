@@ -9,6 +9,20 @@ pub const NO_OWNER: i8 = 0;
 
 pub type ValueGrid = [[i8; COLS]; ROWS];
 pub type OwnerGrid = [[i8; COLS]; ROWS];
+pub type MQualityGrid = [[i8; COLS]; ROWS];
+
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+pub struct GeometryConfig {
+    pub corner_weight: i16,
+    pub edge_weight: i16,
+    pub center_weight: i16,
+    pub connectivity_weight: i16,
+    pub steal_weight: i16,
+    pub barrier_weight: i16,
+    pub compact_bonus: i16,
+    pub risk_penalty: i16,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
