@@ -1,0 +1,25 @@
+# Fingerprint entries for main4.cpp and main5.cpp
+# Computed from 14-game matches (seed 42, 10s budget)
+
+# main4.cpp (agent-i-think-change, Cordyceps-based)
+id = 10
+style = 6
+side_mask = 3
+min_moves = 10
+confidence_threshold = 40
+margin_to_second = 10
+mean = 940 21 17 50 62 0 6 26
+var = 500 100 80 120 120 50 30 80
+prior_config_id = 1
+
+---
+# main5.cpp (weak Cordyceps variant)
+id = 11
+style = 7
+side_mask = 3
+min_moves = 5
+confidence_threshold = 35
+margin_to_second = 5
+mean = 515 15 0 18 60 0 68 0
+var = 300 80 20 60 100 20 150 30
+prior_config_id = 2
