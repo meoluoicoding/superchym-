@@ -1,6 +1,6 @@
 // opponent_db.rs — from opponent_db.hpp + opponent_db.cpp
 
-use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicI32};
+use std::sync::atomic::AtomicPtr;
 use crate::types::*;
 
 // ====== Binary Format Constants ======
@@ -285,10 +285,6 @@ pub fn g_opponent_db() -> &'static Mutex<OpponentDB> {
 pub static G_ACTIVE_PRIOR_CONFIG: AtomicPtr<MovePriorConfig> =
     AtomicPtr::new(std::ptr::null_mut());
 
-// Current matched opponent style (for search engine to read)
-pub static G_MATCHED_STYLE: AtomicU32 = AtomicU32::new(0); // KnownStyle as u32
-pub static G_MATCH_CONFIDENCE: AtomicI32 = AtomicI32::new(0); // confidence * 100
-
 // CRC32 (nibble-by-nibble)
 fn crc32_simple(data: &[u8]) -> u32 {
     const TABLE: [u32; 16] = [
@@ -370,9 +366,6 @@ impl OpponentFingerprint {
         let mut best_dist: f32 = 1e30;
         let mut second_dist: f32 = 1e30;
 
-        // Per-dimension importance weights (steal/barrier/pass more discriminative)
-        const DIM_WEIGHTS: [f32; 8] = [0.8, 1.0, 1.2, 1.0, 1.0, 1.5, 1.3, 1.4];
-
         for (i, fp) in fps.iter().enumerate() {
             let first_ok = (fp.side_mask & 1) != 0 && self.we_are_first;
             let second_ok = (fp.side_mask & 2) != 0 && !self.we_are_first;
@@ -392,7 +385,7 @@ impl OpponentFingerprint {
                 } else {
                     diff
                 };
-                dist += DIM_WEIGHTS[d] * scaled * scaled;
+                dist += scaled * scaled;
             }
 
             if dist < best_dist {
@@ -408,27 +401,15 @@ impl OpponentFingerprint {
             return KnownStyle::Unknown;
         }
 
-        // Confidence: ratio-based
-        if second_dist < 1e29 && second_dist > 0.01 {
+        if second_dist < 1e29 && second_dist > 0.0 {
             *out_confidence = 1.0 - (best_dist / second_dist);
         } else {
-            // Single match: high confidence (no ambiguity with alternatives)
-            *out_confidence = 0.95;
+            *out_confidence = 1.0;
         }
         *out_margin = second_dist - best_dist;
 
-        // Adaptive threshold: lower when we have more observations
         let best_fp = &fps[best_idx as usize];
-        let base_threshold = best_fp.confidence_threshold as f32;
-        let adaptive_threshold = if self.move_count >= 15 {
-            base_threshold * 0.75
-        } else if self.move_count >= 10 {
-            base_threshold * 0.85
-        } else {
-            base_threshold
-        };
-
-        if (*out_confidence * 100.0) < adaptive_threshold {
+        if (*out_confidence * 100.0) < best_fp.confidence_threshold as f32 {
             return KnownStyle::Unknown;
         }
 
@@ -439,8 +420,6 @@ impl OpponentFingerprint {
             3 => KnownStyle::CordycepsBalanced,
             4 => KnownStyle::RustOld,
             5 => KnownStyle::RustUpdate,
-            6 => KnownStyle::Main4Cordyceps,
-            7 => KnownStyle::Main5Cordyceps,
             _ => KnownStyle::Unknown,
         }
     }
