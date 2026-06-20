@@ -2,13 +2,49 @@ use crate::board::Board;
 use crate::types::*;
 
 // ====== Zobrist Hashing ======
-// Single sequential seed matching C++ exactly
+// MT19937-64 for better hash quality
 
-fn xorshift64(state: &mut u64) -> u64 {
-    *state ^= *state << 13;
-    *state ^= *state >> 7;
-    *state ^= *state << 17;
-    *state
+struct MT19937 {
+    mt: [u64; 312],
+    mti: usize,
+}
+
+impl MT19937 {
+    fn new(seed: u64) -> Self {
+        let mut mt = [0u64; 312];
+        mt[0] = seed;
+        for i in 1..312 {
+            mt[i] = 6364136223846793005u64.wrapping_mul(mt[i - 1] ^ (mt[i - 1] >> 62)) + i as u64;
+        }
+        MT19937 { mt, mti: 312 }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        if self.mti >= 312 {
+            self.generate();
+        }
+        let x = self.mt[self.mti];
+        self.mti += 1;
+        // Tempering
+        let x = x ^ (x >> 29) & 0x5555555555555555;
+        let x = x ^ (x << 17) & 0x71D67FFFEDA60000;
+        let x = x ^ (x << 37) & 0xFFF7EEE000000000;
+        x ^ (x >> 43)
+    }
+
+    fn generate(&mut self) {
+        for i in 0..156 {
+            let y = (self.mt[i] & 0xFFFFFFFF80000000) | (self.mt[i + 1] & 0x7FFFFFFF);
+            self.mt[i] = self.mt[i + 156] ^ (y >> 1) ^ ((y & 1) * 0xB5026F5AA96619E9);
+        }
+        for i in 156..311 {
+            let y = (self.mt[i] & 0xFFFFFFFF80000000) | (self.mt[i + 1] & 0x7FFFFFFF);
+            self.mt[i] = self.mt[i - 156] ^ (y >> 1) ^ ((y & 1) * 0xB5026F5AA96619E9);
+        }
+        let y = (self.mt[311] & 0xFFFFFFFF80000000) | (self.mt[0] & 0x7FFFFFFF);
+        self.mt[311] = self.mt[155] ^ (y >> 1) ^ ((y & 1) * 0xB5026F5AA96619E9);
+        self.mti = 0;
+    }
 }
 
 struct ZobristTables {
@@ -22,12 +58,12 @@ static ZOBRIST: std::sync::OnceLock<ZobristTables> = std::sync::OnceLock::new();
 
 fn get_zobrist() -> &'static ZobristTables {
     ZOBRIST.get_or_init(|| {
-        let mut seed = 1234567890123456789u64;
+        let mut rng = MT19937::new(1234567890123456789u64);
         let mut value = [[[0u64; 10]; COLS]; ROWS];
         for r in 0..ROWS {
             for c in 0..COLS {
                 for v in 0..10 {
-                    value[r][c][v] = xorshift64(&mut seed);
+                    value[r][c][v] = rng.next_u64();
                 }
             }
         }
@@ -35,14 +71,14 @@ fn get_zobrist() -> &'static ZobristTables {
         for r in 0..ROWS {
             for c in 0..COLS {
                 for o in 0..3 {
-                    owner[r][c][o] = xorshift64(&mut seed);
+                    owner[r][c][o] = rng.next_u64();
                 }
             }
         }
-        let player = xorshift64(&mut seed);
+        let player = rng.next_u64();
         let mut passes = [0u64; 3];
         for i in 0..3 {
-            passes[i] = xorshift64(&mut seed);
+            passes[i] = rng.next_u64();
         }
         ZobristTables { value, owner, player, passes }
     })
