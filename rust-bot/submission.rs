@@ -1861,7 +1861,7 @@ pub mod search {
 
         // ====== Transposition Table ======
 
-        pub const TT_SIZE: usize = 1 << 22;
+        pub const TT_SIZE: usize = 1 << 24;
 
         #[derive(Clone, Copy, Default)]
         pub struct CompactTTEntry {
