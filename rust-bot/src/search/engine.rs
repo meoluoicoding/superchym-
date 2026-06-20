@@ -45,6 +45,20 @@ fn should_try_pass(board: &Board, ctx: &SearchCtx) -> bool {
         let opp = opponent(p);
         return board.owned_cells(p) - board.owned_cells(opp) > 0;
     }
+    // Improved pass strategy: pass when leading significantly
+    let p = board.player;
+    let opp = opponent(p);
+    let margin = board.owned_cells(p) - board.owned_cells(opp);
+    
+    // Pass if leading by 10+ cells (moderate advantage)
+    if margin >= 10 {
+        return true;
+    }
+    // Pass if opponent just passed and we're ahead
+    if board.consecutive_passes >= 1 && margin > 0 {
+        return true;
+    }
+    // Original: pass when eval positive
     evaluate(board, ctx.is_first) > 0
 }
 
@@ -139,7 +153,7 @@ fn apply_second_defensive_biases(
             40
         };
         let counter_bonus = if steal > 0 {
-            if opening_phase { steal * 85 } else { steal * 60 }
+            if opening_phase { steal * 95 } else { steal * 70 }  // slight increase from 85/60
         } else {
             0
         };
