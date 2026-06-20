@@ -1036,7 +1036,7 @@ pub mod eval {
 pub mod opponent_db {
     // opponent_db.rs — from opponent_db.hpp + opponent_db.cpp
 
-    use std::sync::atomic::AtomicPtr;
+    use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicI32};
     use crate::types::*;
 
     // ====== Binary Format Constants ======
@@ -1321,6 +1321,10 @@ pub mod opponent_db {
     pub static G_ACTIVE_PRIOR_CONFIG: AtomicPtr<MovePriorConfig> =
         AtomicPtr::new(std::ptr::null_mut());
 
+    // Current matched opponent style (for search engine to read)
+    pub static G_MATCHED_STYLE: AtomicU32 = AtomicU32::new(0); // KnownStyle as u32
+    pub static G_MATCH_CONFIDENCE: AtomicI32 = AtomicI32::new(0); // confidence * 100
+
     // CRC32 (nibble-by-nibble)
     fn crc32_simple(data: &[u8]) -> u32 {
         const TABLE: [u32; 16] = [
@@ -1402,6 +1406,9 @@ pub mod opponent_db {
             let mut best_dist: f32 = 1e30;
             let mut second_dist: f32 = 1e30;
 
+            // Per-dimension importance weights (steal/barrier/pass more discriminative)
+            const DIM_WEIGHTS: [f32; 8] = [0.8, 1.0, 1.2, 1.0, 1.0, 1.5, 1.3, 1.4];
+
             for (i, fp) in fps.iter().enumerate() {
                 let first_ok = (fp.side_mask & 1) != 0 && self.we_are_first;
                 let second_ok = (fp.side_mask & 2) != 0 && !self.we_are_first;
@@ -1421,7 +1428,7 @@ pub mod opponent_db {
                     } else {
                         diff
                     };
-                    dist += scaled * scaled;
+                    dist += DIM_WEIGHTS[d] * scaled * scaled;
                 }
 
                 if dist < best_dist {
@@ -1437,15 +1444,27 @@ pub mod opponent_db {
                 return KnownStyle::Unknown;
             }
 
-            if second_dist < 1e29 && second_dist > 0.0 {
+            // Confidence: ratio-based
+            if second_dist < 1e29 && second_dist > 0.01 {
                 *out_confidence = 1.0 - (best_dist / second_dist);
             } else {
-                *out_confidence = 1.0;
+                // Single match: high confidence (no ambiguity with alternatives)
+                *out_confidence = 0.95;
             }
             *out_margin = second_dist - best_dist;
 
+            // Adaptive threshold: lower when we have more observations
             let best_fp = &fps[best_idx as usize];
-            if (*out_confidence * 100.0) < best_fp.confidence_threshold as f32 {
+            let base_threshold = best_fp.confidence_threshold as f32;
+            let adaptive_threshold = if self.move_count >= 15 {
+                base_threshold * 0.75
+            } else if self.move_count >= 10 {
+                base_threshold * 0.85
+            } else {
+                base_threshold
+            };
+
+            if (*out_confidence * 100.0) < adaptive_threshold {
                 return KnownStyle::Unknown;
             }
 
@@ -1468,7 +1487,7 @@ pub mod protocol {
 
     use std::io::{BufRead, Write};
     use crate::board::Board;
-    use crate::opponent_db::{g_opponent_db, G_ACTIVE_PRIOR_CONFIG, OpponentFingerprint};
+    use crate::opponent_db::{g_opponent_db, G_ACTIVE_PRIOR_CONFIG, G_MATCHED_STYLE, G_MATCH_CONFIDENCE, OpponentFingerprint};
     use crate::search::{search_best_move, ensure_tt_ready};
     use crate::types::*;
 
@@ -1486,6 +1505,8 @@ pub mod protocol {
         matched_style: KnownStyle,
         match_confidence: f32,
         fingerprint_checked: bool,
+        fingerprint_check_interval: i32,
+        last_check_move: i32,
     }
 
     impl Protocol {
@@ -1520,6 +1541,8 @@ pub mod protocol {
                 matched_style: KnownStyle::Unknown,
                 match_confidence: 0.0,
                 fingerprint_checked: false,
+                fingerprint_check_interval: 3,
+                last_check_move: 0,
             }
         }
 
@@ -1590,6 +1613,8 @@ pub mod protocol {
             self.matched_style = KnownStyle::Unknown;
             self.match_confidence = 0.0;
             self.fingerprint_checked = false;
+            self.fingerprint_check_interval = 3;
+            self.last_check_move = 0;
             self.activate_side_prior();
 
             // INIT doesn't output anything in the original protocol
@@ -1733,41 +1758,65 @@ pub mod protocol {
             }
 
             // Try to match known fingerprint after sufficient observations
-            if !self.fingerprint_checked && self.opp_move_counter >= 5 {
+            // Re-check periodically to improve accuracy as more data accumulates
+            let should_check = if !self.fingerprint_checked && self.opp_move_counter >= 5 {
+                true
+            } else if self.fingerprint_checked
+                && self.opp_move_counter >= self.last_check_move + self.fingerprint_check_interval
+                && self.match_confidence < 0.80
+            {
+                true
+            } else {
+                false
+            };
+
+            if should_check {
                     let db = g_opponent_db().lock().unwrap();
                 let fps = db.fingerprints();
                 let mut conf = 0.0f32;
                 let mut margin = 0.0f32;
                 let style = self.opp_fp.match_fingerprint(fps, &mut conf, &mut margin);
 
-                if style != KnownStyle::Unknown && conf >= 0.50 {
+                if style != KnownStyle::Unknown && conf >= 0.40 {
+                    let old_style = self.matched_style;
                     self.matched_style = style;
                     self.match_confidence = conf;
                     self.fingerprint_checked = true;
+                    self.last_check_move = self.opp_move_counter;
 
-                    // Select prior config based on matched fingerprint
-                    for fp in fps {
-                        let fp_style = match fp.style {
-                            1 => KnownStyle::CordycepsAttack,
-                            2 => KnownStyle::CordycepsDefense,
-                            3 => KnownStyle::CordycepsBalanced,
-                            4 => KnownStyle::RustOld,
-                            5 => KnownStyle::RustUpdate,
-                            _ => KnownStyle::Unknown,
-                        };
-                        if fp_style == style {
-                            if let Some(cfg) = db.get_prior_config(fp.prior_config_id) {
-                                // Leak a Box to get a 'static pointer — small, lives for program lifetime
-                                let boxed = Box::new(cfg.clone());
-                                let raw = Box::into_raw(boxed);
-                                G_ACTIVE_PRIOR_CONFIG.store(
-                                    raw,
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
+                    // Update globals for search engine
+                    G_MATCHED_STYLE.store(style as u32, std::sync::atomic::Ordering::Relaxed);
+                    G_MATCH_CONFIDENCE.store((conf * 100.0) as i32, std::sync::atomic::Ordering::Relaxed);
+
+                    // Only update prior config if style changed or first match
+                    if old_style != style || !self.fingerprint_checked {
+                        // Select style-specific counter prior config
+                        for fp in fps {
+                            let fp_style = match fp.style {
+                                1 => KnownStyle::CordycepsAttack,
+                                2 => KnownStyle::CordycepsDefense,
+                                3 => KnownStyle::CordycepsBalanced,
+                                4 => KnownStyle::RustOld,
+                                5 => KnownStyle::RustUpdate,
+                                _ => KnownStyle::Unknown,
+                            };
+                            if fp_style == style {
+                                if let Some(cfg) = db.get_prior_config(fp.prior_config_id) {
+                                    // Leak a Box to get a 'static pointer — small, lives for program lifetime
+                                    let boxed = Box::new(cfg.clone());
+                                    let raw = Box::into_raw(boxed);
+                                    G_ACTIVE_PRIOR_CONFIG.store(
+                                        raw,
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+                                }
+                                break;
                             }
-                            break;
                         }
                     }
+                } else if self.fingerprint_checked {
+                    // Update last_check_move even if no new match
+                    self.last_check_move = self.opp_move_counter;
                 }
             }
         }
