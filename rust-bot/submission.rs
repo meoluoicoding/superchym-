@@ -56,7 +56,8 @@ pub mod types {
         CordycepsBalanced = 3,
         RustOld = 4,
         RustUpdate = 5,
-        Main5Cordyceps = 6,
+        Main4Cordyceps = 6,
+        Main5Cordyceps = 7,
     }
 
     #[derive(Clone, Debug, Default)]
@@ -1476,7 +1477,8 @@ pub mod opponent_db {
                 3 => KnownStyle::CordycepsBalanced,
                 4 => KnownStyle::RustOld,
                 5 => KnownStyle::RustUpdate,
-                6 => KnownStyle::Main5Cordyceps,
+                6 => KnownStyle::Main4Cordyceps,
+                7 => KnownStyle::Main5Cordyceps,
                 _ => KnownStyle::Unknown,
             }
         }
@@ -1800,7 +1802,8 @@ pub mod protocol {
                                 3 => KnownStyle::CordycepsBalanced,
                                 4 => KnownStyle::RustOld,
                                 5 => KnownStyle::RustUpdate,
-                                6 => KnownStyle::Main5Cordyceps,
+                                6 => KnownStyle::Main4Cordyceps,
+                                7 => KnownStyle::Main5Cordyceps,
                                 _ => KnownStyle::Unknown,
                             };
                             if fp_style == style {
@@ -1839,6 +1842,7 @@ pub mod protocol {
                     KnownStyle::CordycepsBalanced => "CORDYCEPS_BALANCED",
                     KnownStyle::RustOld => "RUST_OLD",
                     KnownStyle::RustUpdate => "RUST_UPDATE",
+                    KnownStyle::Main4Cordyceps => "MAIN4_CORDYCEPS",
                     KnownStyle::Main5Cordyceps => "MAIN5_CORDYCEPS",
                     KnownStyle::Unknown => "UNKNOWN",
                 };

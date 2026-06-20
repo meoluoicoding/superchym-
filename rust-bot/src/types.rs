@@ -50,7 +50,8 @@ pub enum KnownStyle {
     CordycepsBalanced = 3,
     RustOld = 4,
     RustUpdate = 5,
-    Main5Cordyceps = 6,
+    Main4Cordyceps = 6,
+    Main5Cordyceps = 7,
 }
 
 #[derive(Clone, Debug, Default)]
