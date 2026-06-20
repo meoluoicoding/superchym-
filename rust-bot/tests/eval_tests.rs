@@ -109,13 +109,13 @@ fn slow_evaluate(board: &mushroom_bot::board::Board) -> i32 {
         }
     }
 
-    territory * 148
-        + mobility_score * 20
-        + connectivity * 19
-        + corners * 18
-        + edges * 3
-        + recapture_swing * 39
-        - vulnerability * 9
+    territory * 74
+        + mobility_score * (-42)
+        + connectivity * 93
+        + corners * 80
+        + edges * 40
+        + recapture_swing * 101
+        - vulnerability * 83
 }
 
 #[test]

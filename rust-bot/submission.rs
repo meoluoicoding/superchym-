@@ -15,6 +15,20 @@ pub mod types {
 
     pub type ValueGrid = [[i8; COLS]; ROWS];
     pub type OwnerGrid = [[i8; COLS]; ROWS];
+    pub type MQualityGrid = [[i8; COLS]; ROWS];
+
+    #[derive(Clone, Copy, Debug, Default)]
+    #[repr(C)]
+    pub struct GeometryConfig {
+        pub corner_weight: i16,
+        pub edge_weight: i16,
+        pub center_weight: i16,
+        pub connectivity_weight: i16,
+        pub steal_weight: i16,
+        pub barrier_weight: i16,
+        pub compact_bonus: i16,
+        pub risk_penalty: i16,
+    }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     #[repr(u8)]
@@ -231,9 +245,14 @@ pub mod board {
         pub edges_second: i32,
         pub live_adjacent_first: i32,
         pub live_adjacent_second: i32,
+        pub quality_first: i32,
+        pub quality_second: i32,
+        pub center_first: i32,
+        pub center_second: i32,
     }
 
     // MoveRecord for undo — stores all changes made by a move.
+    #[derive(Clone, Copy, Debug, Default)]
     pub struct CellChange {
         pub r: i8,
         pub c: i8,
@@ -241,8 +260,11 @@ pub mod board {
         pub old_owner: i8,
     }
 
+    const MAX_CELL_CHANGES: usize = ROWS * COLS;
+
     pub struct MoveRecord {
-        pub changes: Vec<CellChange>,
+        pub changes: [CellChange; MAX_CELL_CHANGES],
+        pub change_count: usize,
         pub old_player: i8,
         pub old_consecutive_passes: i32,
         pub old_hash: u64,
@@ -253,7 +275,8 @@ pub mod board {
     impl MoveRecord {
         pub fn new() -> Self {
             MoveRecord {
-                changes: Vec::with_capacity(170),
+                changes: [CellChange::default(); MAX_CELL_CHANGES],
+                change_count: 0,
                 old_player: 0,
                 old_consecutive_passes: 0,
                 old_hash: 0,
@@ -312,6 +335,13 @@ pub mod board {
                     }
                     if r + 1 < ROWS && owner != NO_OWNER && self.owners[r + 1][c] == owner {
                         Self::adjust_connectivity_count(&mut self.eval_cache, owner, 1);
+                    }
+                    // Geometry features
+                    if owner != NO_OWNER {
+                        Self::adjust_quality(&mut self.eval_cache, owner, Self::cell_quality(r, c));
+                        if Self::cell_is_center(r, c) {
+                            Self::adjust_center(&mut self.eval_cache, owner, 1);
+                        }
                     }
                 }
             }
@@ -389,6 +419,34 @@ pub mod board {
             }
         }
 
+        fn adjust_quality(cache: &mut EvalCache, owner: i8, delta: i32) {
+            if owner == FIRST_PLAYER {
+                cache.quality_first += delta;
+            } else if owner == SECOND_PLAYER {
+                cache.quality_second += delta;
+            }
+        }
+
+        fn adjust_center(cache: &mut EvalCache, owner: i8, delta: i32) {
+            if owner == FIRST_PLAYER {
+                cache.center_first += delta;
+            } else if owner == SECOND_PLAYER {
+                cache.center_second += delta;
+            }
+        }
+
+        fn cell_is_center(r: usize, c: usize) -> bool {
+            r >= 3 && r <= 6 && c >= 5 && c <= 11
+        }
+
+        fn cell_quality(r: usize, c: usize) -> i32 {
+            if let Some(q) = crate::mquality::get_mquality() {
+                q[r][c] as i32
+            } else {
+                1
+            }
+        }
+
         fn add_flag(flagged: &mut [[bool; COLS]; ROWS], r: i32, c: i32) {
             if r >= 0 && r < ROWS as i32 && c >= 0 && c < COLS as i32 {
                 flagged[r as usize][c as usize] = true;
@@ -454,6 +512,11 @@ pub mod board {
                     if Self::cell_is_edge(ru, cu) {
                         Self::adjust_edge_count(&mut self.eval_cache, old_owner, -1);
                     }
+                    // Remove quality and center for old owner
+                    Self::adjust_quality(&mut self.eval_cache, old_owner, -Self::cell_quality(ru, cu));
+                    if Self::cell_is_center(ru, cu) {
+                        Self::adjust_center(&mut self.eval_cache, old_owner, -1);
+                    }
 
                     self.replace_cell(ru, cu, 0, self.player);
 
@@ -464,6 +527,11 @@ pub mod board {
                     }
                     if Self::cell_is_edge(ru, cu) {
                         Self::adjust_edge_count(&mut self.eval_cache, new_owner, 1);
+                    }
+                    // Add quality and center for new owner
+                    Self::adjust_quality(&mut self.eval_cache, new_owner, Self::cell_quality(ru, cu));
+                    if Self::cell_is_center(ru, cu) {
+                        Self::adjust_center(&mut self.eval_cache, new_owner, 1);
                     }
                 }
             }
@@ -545,7 +613,7 @@ pub mod board {
             record.old_consecutive_passes = self.consecutive_passes;
             record.old_hash = self.hash;
             record.old_eval_cache = self.eval_cache;
-            record.changes.clear();
+            record.change_count = 0;
 
             if mv.is_pass() {
                 record.was_pass = true;
@@ -560,12 +628,13 @@ pub mod board {
             self.update_hash_before_turn_change();
             for r in mv.r1..=mv.r2 {
                 for c in mv.c1..=mv.c2 {
-                    record.changes.push(CellChange {
+                    record.changes[record.change_count] = CellChange {
                         r: r as i8,
                         c: c as i8,
                         old_value: self.values[r as usize][c as usize],
                         old_owner: self.owners[r as usize][c as usize],
-                    });
+                    };
+                    record.change_count += 1;
                 }
             }
             self.update_eval_cache_for_move(mv);
@@ -582,7 +651,7 @@ pub mod board {
             if record.was_pass {
                 return;
             }
-            for ch in &record.changes {
+            for ch in &record.changes[..record.change_count] {
                 self.values[ch.r as usize][ch.c as usize] = ch.old_value;
                 self.owners[ch.r as usize][ch.c as usize] = ch.old_owner;
             }
@@ -947,13 +1016,13 @@ pub mod eval {
                     vulnerability: 9,
                 },
                 second: EvalWeights {
-                    territory: 140,
-                    mobility: 16,
-                    connectivity: 28,
-                    corners: 20,
-                    edges: 6,
-                    recapture: 28,
-                    vulnerability: 18,
+                    territory: 148,
+                    mobility: 20,
+                    connectivity: 19,
+                    corners: 18,
+                    edges: 3,
+                    recapture: 39,
+                    vulnerability: 9,
                 },
             }
         })
@@ -999,12 +1068,25 @@ pub mod eval {
             cache.live_adjacent_second
         };
 
+        // Geometry: cached quality and center (O(1) lookup instead of O(170) iteration)
+        let quality_diff = if player == FIRST_PLAYER {
+            cache.quality_first - cache.quality_second
+        } else {
+            cache.quality_second - cache.quality_first
+        };
+        let center_diff = if player == FIRST_PLAYER {
+            cache.center_first - cache.center_second
+        } else {
+            cache.center_second - cache.center_first
+        };
+
         let weights = get_weights();
         let w = if is_first {
             weights.first
         } else {
             weights.second
         };
+
         territory * w.territory
             + mobility_score * w.mobility
             + connectivity * w.connectivity
@@ -1012,6 +1094,8 @@ pub mod eval {
             + edges * w.edges
             + recapture_swing * w.recapture
             - vulnerability * w.vulnerability
+            + quality_diff / 10
+            + center_diff * 2
     }
 
     pub fn score_move(board: &Board, mv: &Move, is_first: bool) -> i32 {
@@ -1023,6 +1107,62 @@ pub mod eval {
         let mut copy = board.clone();
         copy.apply_move(mv);
         evaluate(&copy, is_first)
+    }
+
+    // Endgame eval: territory-dominated, gradual blend from normal weights.
+    // In endgame, territory matters more but other features still help.
+    pub fn evaluate_endgame(board: &Board, _is_first: bool) -> i32 {
+        EVAL_CALLS.fetch_add(1, Ordering::Relaxed);
+
+        let player = board.player;
+        let cache = &board.eval_cache;
+
+        let territory = if player == FIRST_PLAYER {
+            cache.owned_first - cache.owned_second
+        } else {
+            cache.owned_second - cache.owned_first
+        };
+
+        let connectivity = if player == FIRST_PLAYER {
+            cache.connectivity_first - cache.connectivity_second
+        } else {
+            cache.connectivity_second - cache.connectivity_first
+        };
+
+        let corners = if player == FIRST_PLAYER {
+            cache.corners_first - cache.corners_second
+        } else {
+            cache.corners_second - cache.corners_first
+        };
+
+        let edges = if player == FIRST_PLAYER {
+            cache.edges_first - cache.edges_second
+        } else {
+            cache.edges_second - cache.edges_first
+        };
+
+        let recapture_swing = {
+            let opp = opponent(player);
+            if opp == FIRST_PLAYER {
+                cache.live_adjacent_first
+            } else {
+                cache.live_adjacent_second
+            }
+        };
+
+        let vulnerability = if player == FIRST_PLAYER {
+            cache.live_adjacent_first
+        } else {
+            cache.live_adjacent_second
+        };
+
+        // Territory-weighted: territory gets ~1.5x boost, others slightly reduced
+        territory * 220
+            + connectivity * 14
+            + corners * 12
+            + edges * 2
+            + recapture_swing * 30
+            - vulnerability * 10
     }
 }
 
@@ -1042,6 +1182,8 @@ pub mod opponent_db {
     const DB_SECTION_CENTROIDS: u32 = 2;
     const DB_SECTION_PRIOR_CONFIGS: u32 = 3;
     const DB_SECTION_METADATA: u32 = 4;
+    const DB_SECTION_MQUALITY: u32 = 5;
+    const DB_SECTION_GEOMETRY: u32 = 6;
 
     #[repr(C)]
     #[derive(Clone, Copy, Default, Debug)]
@@ -1247,6 +1389,27 @@ pub mod opponent_db {
                             self.prior_config_count += 1;
                         }
                     }
+                    DB_SECTION_MQUALITY => {
+                        // MQualityGrid: 10*17 = 170 bytes of i8
+                        if sec.data_size as usize >= ROWS * COLS {
+                            let mut grid = [[0i8; COLS]; ROWS];
+                            for r in 0..ROWS {
+                                for c in 0..COLS {
+                                    grid[r][c] = sec_data[r * COLS + c] as i8;
+                                }
+                            }
+                            crate::mquality::set_mquality(grid);
+                        }
+                    }
+                    DB_SECTION_GEOMETRY => {
+                        // GeometryConfig: 8 x i16 = 16 bytes
+                        if sec.data_size as usize >= std::mem::size_of::<GeometryConfig>() {
+                            let cfg: GeometryConfig = unsafe {
+                                std::ptr::read_unaligned(sec_data.as_ptr() as *const GeometryConfig)
+                            };
+                            crate::mquality::set_geometry(cfg);
+                        }
+                    }
                     DB_SECTION_CENTROIDS | DB_SECTION_METADATA => {
                         // Reserved
                     }
@@ -1315,6 +1478,11 @@ pub mod opponent_db {
     pub static G_ACTIVE_PRIOR_CONFIG: AtomicPtr<MovePriorConfig> =
         AtomicPtr::new(std::ptr::null_mut());
 
+    // Current matched opponent style (for search engine to read)
+    use std::sync::atomic::{AtomicU32, AtomicI32};
+    pub static G_MATCHED_STYLE: AtomicU32 = AtomicU32::new(0); // KnownStyle as u32
+    pub static G_MATCH_CONFIDENCE: AtomicI32 = AtomicI32::new(0); // confidence * 100
+
     // CRC32 (nibble-by-nibble)
     fn crc32_simple(data: &[u8]) -> u32 {
         const TABLE: [u32; 16] = [
@@ -1368,17 +1536,22 @@ pub mod opponent_db {
             let pass = self.pass_seen;
             let barrier = self.barrier_freq;
 
-            fv.dim[0] = ((total * 128) / n) as i16;
-            fv.dim[1] = ((medium * 128) / n) as i16;
-            fv.dim[2] = ((large * 128) / n) as i16;
-            fv.dim[3] = ((tall * 128) / n) as i16;
-            fv.dim[4] = ((wide * 128) / n) as i16;
-            fv.dim[5] = ((steal * 128) / n) as i16;
-            fv.dim[6] = ((pass * 128) / n) as i16;
-            fv.dim[7] = ((barrier * 128) / n) as i16;
+            // Enhanced: use max(n,1) to avoid division by zero; clamp to i16 range
+            fv.dim[0] = ((total * 128) / n).min(i16::MAX as i32) as i16;       // avg_area
+            fv.dim[1] = ((medium * 128) / n).min(i16::MAX as i32) as i16;      // medium_ratio
+            fv.dim[2] = ((large * 128) / n).min(i16::MAX as i32) as i16;       // large_ratio
+            fv.dim[3] = ((tall * 128) / n).min(i16::MAX as i32) as i16;        // portrait_ratio
+            fv.dim[4] = ((wide * 128) / n).min(i16::MAX as i32) as i16;        // landscape_ratio
+            fv.dim[5] = ((steal * 128) / n).min(i16::MAX as i32) as i16;       // steal_ratio
+            fv.dim[6] = ((pass * 128) / n).min(i16::MAX as i32) as i16;        // pass_ratio
+            fv.dim[7] = ((barrier * 128) / n).min(i16::MAX as i32) as i16;     // barrier_ratio
             fv
         }
 
+        /// Enhanced matching with:
+        /// - Per-dimension weighting (steal/barrier more discriminative)
+        /// - Adaptive confidence threshold based on number of moves observed
+        /// - Better distance metric (Mahalanobis-inspired)
         pub fn match_fingerprint(
             &self,
             fps: &[KnownFingerprint],
@@ -1395,6 +1568,10 @@ pub mod opponent_db {
             let mut best_idx: i32 = -1;
             let mut best_dist: f32 = 1e30;
             let mut second_dist: f32 = 1e30;
+
+            // Per-dimension importance weights (steal/barrier/pass more discriminative)
+            // These weight higher-entropy features more heavily
+            const DIM_WEIGHTS: [f32; 8] = [0.8, 1.0, 1.2, 1.0, 1.0, 1.5, 1.3, 1.4];
 
             for (i, fp) in fps.iter().enumerate() {
                 let first_ok = (fp.side_mask & 1) != 0 && self.we_are_first;
@@ -1415,7 +1592,7 @@ pub mod opponent_db {
                     } else {
                         diff
                     };
-                    dist += scaled * scaled;
+                    dist += DIM_WEIGHTS[d] * scaled * scaled;
                 }
 
                 if dist < best_dist {
@@ -1431,15 +1608,32 @@ pub mod opponent_db {
                 return KnownStyle::Unknown;
             }
 
-            if second_dist < 1e29 && second_dist > 0.0 {
+            // Confidence: ratio-based
+            // Two matches: ratio tells us how much better best is vs second
+            // Single match: high confidence (no ambiguity with alternatives)
+            if second_dist < 1e29 && second_dist > 0.01 {
                 *out_confidence = 1.0 - (best_dist / second_dist);
             } else {
-                *out_confidence = 1.0;
+                // Single match: only one candidate exists, so no confusion possible.
+                // The absolute distance only matters for the threshold check below.
+                // Return high confidence — threshold will filter poor matches.
+                *out_confidence = 0.95;
             }
             *out_margin = second_dist - best_dist;
 
+            // Adaptive threshold: lower when we have more observations
             let best_fp = &fps[best_idx as usize];
-            if (*out_confidence * 100.0) < best_fp.confidence_threshold as f32 {
+            let base_threshold = best_fp.confidence_threshold as f32;
+            // After 10+ moves, reduce threshold by 15%; after 15+, by 25%
+            let adaptive_threshold = if self.move_count >= 15 {
+                base_threshold * 0.75
+            } else if self.move_count >= 10 {
+                base_threshold * 0.85
+            } else {
+                base_threshold
+            };
+
+            if (*out_confidence * 100.0) < adaptive_threshold {
                 return KnownStyle::Unknown;
             }
 
@@ -1453,6 +1647,34 @@ pub mod opponent_db {
                 _ => KnownStyle::Unknown,
             }
         }
+
+        /// Get shape distribution entropy (higher = more diverse shapes)
+        pub fn shape_entropy(&self) -> f32 {
+            let n = self.move_count;
+            if n <= 0 { return 0.0; }
+            let mut entropy = 0.0f32;
+            for &count in &self.shape_counts {
+                if count > 0 {
+                    let p = count as f32 / n as f32;
+                    entropy -= p * p.log2();
+                }
+            }
+            entropy
+        }
+
+        /// Get region distribution: how much opponent focuses on center vs edges
+        pub fn center_focus(&self) -> f32 {
+            let total = self.region_counts.iter().sum::<i32>();
+            if total <= 0 { return 0.0; }
+            // CenterInner + CenterOuter / total
+            (self.region_counts[3] + self.region_counts[2]) as f32 / total as f32
+        }
+
+        /// Steal aggressiveness: steals per move, weighted by area
+        pub fn steal_aggressiveness(&self) -> f32 {
+            if self.move_count <= 0 { return 0.0; }
+            self.steal_seen as f32 / self.move_count as f32
+        }
     }
 }
 
@@ -1462,7 +1684,7 @@ pub mod protocol {
 
     use std::io::{BufRead, Write};
     use crate::board::Board;
-    use crate::opponent_db::{g_opponent_db, G_ACTIVE_PRIOR_CONFIG, OpponentFingerprint};
+    use crate::opponent_db::{g_opponent_db, G_ACTIVE_PRIOR_CONFIG, G_MATCHED_STYLE, G_MATCH_CONFIDENCE, OpponentFingerprint};
     use crate::search::{search_best_move, ensure_tt_ready};
     use crate::types::*;
 
@@ -1480,6 +1702,8 @@ pub mod protocol {
         matched_style: KnownStyle,
         match_confidence: f32,
         fingerprint_checked: bool,
+        fingerprint_check_interval: i32, // re-check every N opp moves
+        last_check_move: i32,            // opp_move_counter at last check
     }
 
     impl Protocol {
@@ -1500,6 +1724,40 @@ pub mod protocol {
             }
         }
 
+        /// Select counter-specific prior config based on matched opponent style.
+        /// Different styles require different counter-strategies:
+        /// - CordycepsAttack: boost barriers + steal (defend against aggression)
+        /// - CordycepsDefense: boost territory + connection (out-territory them)
+        /// - CordycepsBalanced: balanced counter (shape diversity)
+        /// - RustOld/RustUpdate: use their own prior configs
+        fn activate_counter_prior(&self, db: &crate::opponent_db::OpponentDB, style: KnownStyle) {
+            // First try to find a style-specific counter config in data.bin
+            for fp in db.fingerprints() {
+                let fp_style = match fp.style {
+                    1 => KnownStyle::CordycepsAttack,
+                    2 => KnownStyle::CordycepsDefense,
+                    3 => KnownStyle::CordycepsBalanced,
+                    4 => KnownStyle::RustOld,
+                    5 => KnownStyle::RustUpdate,
+                    _ => KnownStyle::Unknown,
+                };
+                if fp_style == style {
+                    if let Some(cfg) = db.get_prior_config(fp.prior_config_id) {
+                        let boxed = Box::new(cfg.clone());
+                        let raw = Box::into_raw(boxed);
+                        G_ACTIVE_PRIOR_CONFIG.store(
+                            raw,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        return;
+                    }
+                }
+            }
+
+            // Fallback: use side-based prior
+            self.activate_side_prior();
+        }
+
         pub fn new() -> Self {
             Protocol {
                 board: Board::new(),
@@ -1514,6 +1772,8 @@ pub mod protocol {
                 matched_style: KnownStyle::Unknown,
                 match_confidence: 0.0,
                 fingerprint_checked: false,
+                fingerprint_check_interval: 3, // re-check every 3 opp moves after initial
+                last_check_move: 0,
             }
         }
 
@@ -1584,6 +1844,8 @@ pub mod protocol {
             self.matched_style = KnownStyle::Unknown;
             self.match_confidence = 0.0;
             self.fingerprint_checked = false;
+            self.fingerprint_check_interval = 3;
+            self.last_check_move = 0;
             self.activate_side_prior();
 
             // INIT doesn't output anything in the original protocol
@@ -1727,41 +1989,44 @@ pub mod protocol {
             }
 
             // Try to match known fingerprint after sufficient observations
-            if !self.fingerprint_checked && self.opp_move_counter >= 5 {
-                    let db = g_opponent_db().lock().unwrap();
+            // Re-check periodically to improve accuracy as more data accumulates
+            let should_check = if !self.fingerprint_checked && self.opp_move_counter >= 5 {
+                true
+            } else if self.fingerprint_checked
+                && self.opp_move_counter >= self.last_check_move + self.fingerprint_check_interval
+                && self.match_confidence < 0.80
+            {
+                true
+            } else {
+                false
+            };
+
+            if should_check {
+                let db = g_opponent_db().lock().unwrap();
                 let fps = db.fingerprints();
                 let mut conf = 0.0f32;
                 let mut margin = 0.0f32;
                 let style = self.opp_fp.match_fingerprint(fps, &mut conf, &mut margin);
 
-                if style != KnownStyle::Unknown && conf >= 0.50 {
+                if style != KnownStyle::Unknown && conf >= 0.40 {
+                    let old_style = self.matched_style;
                     self.matched_style = style;
                     self.match_confidence = conf;
                     self.fingerprint_checked = true;
+                    self.last_check_move = self.opp_move_counter;
 
-                    // Select prior config based on matched fingerprint
-                    for fp in fps {
-                        let fp_style = match fp.style {
-                            1 => KnownStyle::CordycepsAttack,
-                            2 => KnownStyle::CordycepsDefense,
-                            3 => KnownStyle::CordycepsBalanced,
-                            4 => KnownStyle::RustOld,
-                            5 => KnownStyle::RustUpdate,
-                            _ => KnownStyle::Unknown,
-                        };
-                        if fp_style == style {
-                            if let Some(cfg) = db.get_prior_config(fp.prior_config_id) {
-                                // Leak a Box to get a 'static pointer — small, lives for program lifetime
-                                let boxed = Box::new(cfg.clone());
-                                let raw = Box::into_raw(boxed);
-                                G_ACTIVE_PRIOR_CONFIG.store(
-                                    raw,
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
-                            }
-                            break;
-                        }
+                    // Update globals for search engine
+                    G_MATCHED_STYLE.store(style as u32, std::sync::atomic::Ordering::Relaxed);
+                    G_MATCH_CONFIDENCE.store((conf * 100.0) as i32, std::sync::atomic::Ordering::Relaxed);
+
+                    // Only update prior config if style changed or first match
+                    if old_style != style || !self.fingerprint_checked {
+                        // Select style-specific counter prior config
+                        self.activate_counter_prior(&db, style);
                     }
+                } else if self.fingerprint_checked {
+                    // Update last_check_move even if no new match
+                    self.last_check_move = self.opp_move_counter;
                 }
             }
         }
@@ -1783,6 +2048,9 @@ pub mod protocol {
                     KnownStyle::RustUpdate => "RUST_UPDATE",
                     KnownStyle::Unknown => "UNKNOWN",
                 };
+                let shape_ent = self.opp_fp.shape_entropy();
+                let center = self.opp_fp.center_focus();
+                let steal_agg = self.opp_fp.steal_aggressiveness();
                 if let Ok(mut f) = std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -1791,12 +2059,14 @@ pub mod protocol {
                     writeln!(
                         f,
                         "G{} {} moves={} opp_moves={} matched={} conf={:.2} \
-                         fv=[{},{},{},{},{},{},{},{}] ply={}",
+                         fv=[{},{},{},{},{},{},{},{}] ply={} \
+                         ent={:.2} center={:.2} steal_agg={:.2}",
                         game, side, self.move_counter, self.opp_move_counter,
                         style, self.match_confidence,
                         fv.dim[0], fv.dim[1], fv.dim[2], fv.dim[3],
                         fv.dim[4], fv.dim[5], fv.dim[6], fv.dim[7],
-                        self.ply_counter
+                        self.ply_counter,
+                        shape_ent, center, steal_agg
                     ).ok();
                 }
             }
@@ -1848,7 +2118,8 @@ pub mod search {
 
     pub mod tt {
         use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
-        use std::sync::{Mutex, OnceLock};
+        use std::cell::UnsafeCell;
+        use std::sync::OnceLock;
 
         use crate::types::*;
 
@@ -1881,12 +2152,17 @@ pub mod search {
 
         pub static NODES_SEARCHED: AtomicU64 = AtomicU64::new(0);
 
-        static TT: OnceLock<Mutex<Vec<TTBucket>>> = OnceLock::new();
+        struct SingleThreadTT(UnsafeCell<Vec<TTBucket>>);
+
+        unsafe impl Sync for SingleThreadTT {}
+
+        static TT: OnceLock<SingleThreadTT> = OnceLock::new();
 
         static TT_AGE: AtomicU8 = AtomicU8::new(1);
 
         pub fn ensure_tt_ready() {
-            let mut tt = TT.get_or_init(|| Mutex::new(Vec::new())).lock().unwrap();
+            let tt = TT.get_or_init(|| SingleThreadTT(UnsafeCell::new(Vec::new())));
+            let tt = unsafe { &mut *tt.0.get() };
             if tt.len() != TT_SIZE {
                 tt.resize(TT_SIZE, TTBucket::default());
             }
@@ -1922,7 +2198,8 @@ pub mod search {
             let pm = pack_move(best_move);
             let d16 = depth as i16;
 
-            let mut tt = TT.get_or_init(|| Mutex::new(Vec::new())).lock().unwrap();
+            let tt = TT.get_or_init(|| SingleThreadTT(UnsafeCell::new(Vec::new())));
+            let tt = unsafe { &mut *tt.0.get() };
             let b = &mut tt[idx];
 
             b.slot0 = CompactTTEntry { key_sig: ksig, depth: d16, flag, age, value, packed_move: pm };
@@ -1946,7 +2223,8 @@ pub mod search {
         ) -> bool {
             let ksig = (key >> 32) as u32;
             let idx = (key as usize) & (TT_SIZE - 1);
-            let tt = TT.get_or_init(|| Mutex::new(Vec::new())).lock().unwrap();
+            let tt = TT.get_or_init(|| SingleThreadTT(UnsafeCell::new(Vec::new())));
+            let tt = unsafe { &*tt.0.get() };
             let b = &tt[idx];
 
             let mut best: Option<CompactTTEntry> = None;
@@ -2093,6 +2371,7 @@ pub mod search {
         use crate::eval::evaluate;
         use crate::types::*;
 
+        use crate::opponent_db::{G_MATCHED_STYLE, G_MATCH_CONFIDENCE};
         use super::ordering::order_moves;
         use super::tt::{advance_tt_age, ensure_tt_ready, pack_move, tt_flag, tt_probe, tt_store, NODES_SEARCHED};
 
@@ -2146,6 +2425,10 @@ pub mod search {
 
         fn apply_second_root_biases(board: &mut Board, moves: &mut [Move], is_first: bool, second_steal: i32) {
             apply_second_defensive_biases(board, moves, is_first, second_steal, true);
+        }
+
+        fn apply_first_root_biases(board: &mut Board, moves: &mut [Move], is_first: bool) {
+            apply_first_defensive_biases(board, moves, is_first, true);
         }
 
         fn immediate_recapture_pressure(board: &Board) -> i32 {
@@ -2272,6 +2555,151 @@ pub mod search {
             }
         }
 
+        /// FIRST player move ordering: build defensible territory, control edges,
+        /// avoid isolation, and opportunistically steal from opponent.
+        /// Unlike SECOND (which focuses on counter-steal), FIRST needs to place
+        /// cells that are hard for opponent to steal while maintaining pressure.
+        fn apply_first_defensive_biases(
+            board: &mut Board,
+            moves: &mut [Move],
+            is_first: bool,
+            include_static_eval: bool,
+        ) {
+            if !is_first {
+                return;
+            }
+
+            let opp_p = opponent(board.player);
+            let claimed_cells = board.owned_cells(FIRST_PLAYER) + board.owned_cells(SECOND_PLAYER);
+            let opening_phase = claimed_cells < 24;
+            let midgame_phase = claimed_cells < 70;
+
+            for m in moves.iter_mut() {
+                if m.is_pass() {
+                    m.priority -= 2000;
+                    continue;
+                }
+
+                let area = (m.r2 - m.r1 + 1) * (m.c2 - m.c1 + 1);
+                let connection = board.connectivity_boost(m.r1, m.c1, m.r2, m.c2);
+                let risk = board.dead_cell_risk_proxy(m.r1, m.c1, m.r2, m.c2);
+                let barrier = board.barrier_potential(m.r1, m.c1, m.r2, m.c2);
+
+                // Steal calculation: opponent cells in the move rectangle adjacent to live mushrooms
+                let mut steal = 0i32;
+                for r in m.r1..=m.r2 {
+                    for c in m.c1..=m.c2 {
+                        let ru = r as usize;
+                        let cu = c as usize;
+                        if board.owners[ru][cu] != opp_p {
+                            continue;
+                        }
+                        let mut adjacent_live = false;
+                        if r > 0 && board.values[ru - 1][cu] > 0 {
+                            adjacent_live = true;
+                        } else if r < ROWS as i32 - 1 && board.values[ru + 1][cu] > 0 {
+                            adjacent_live = true;
+                        } else if c > 0 && board.values[ru][cu - 1] > 0 {
+                            adjacent_live = true;
+                        } else if c < COLS as i32 - 1 && board.values[ru][cu + 1] > 0 {
+                            adjacent_live = true;
+                        }
+                        if adjacent_live {
+                            steal += 1;
+                        }
+                    }
+                }
+
+                // Corner/edge control bonus
+                let r1 = m.r1;
+                let c1 = m.c1;
+                let r2 = m.r2;
+                let c2 = m.c2;
+                let touches_corner = (r1 == 0 && c1 == 0)
+                    || (r1 == 0 && c2 == COLS as i32 - 1)
+                    || (r2 == ROWS as i32 - 1 && c1 == 0)
+                    || (r2 == ROWS as i32 - 1 && c2 == COLS as i32 - 1);
+                let touches_edge = r1 == 0 || r2 == ROWS as i32 - 1 || c1 == 0 || c2 == COLS as i32 - 1;
+                let corner_bonus = if touches_corner { 280 } else { 0 };
+                let edge_bonus = if touches_edge && !touches_corner { 80 } else { 0 };
+
+                // Compact shape: prefer small/medium, penalize spread-out
+                let compact_bonus = if area <= 4 {
+                    140
+                } else if area <= 6 {
+                    70
+                } else if area >= 9 {
+                    -100
+                } else {
+                    0
+                };
+
+                // Connectivity: strongly reward connecting to own cells
+                let connection_bonus = if opening_phase {
+                    connection * 48
+                } else {
+                    connection * 32
+                };
+
+                // Risk: penalize exposed cells (will be stolen by SECOND)
+                let risk_penalty = if opening_phase {
+                    risk * 120
+                } else {
+                    risk * 75
+                };
+
+                // Barrier: control board center to limit opponent expansion
+                let barrier_bonus = if opening_phase {
+                    barrier * 200
+                } else {
+                    barrier * 120
+                };
+
+                // Steal bonus: FIRST should also steal when opportunity arises
+                let steal_bonus = if steal > 0 {
+                    if opening_phase { steal * 70 } else { steal * 50 }
+                } else {
+                    0
+                };
+
+                // Loose shape: cells with no connection and high risk = bad
+                let loose_shape_penalty = if connection == 0 && risk > 0 { 200 } else { 0 };
+
+                // Extension penalty: big moves without steal = risky for FIRST
+                let extension_penalty = if area >= 7 && connection <= 1 && steal == 0 { 140 } else { 0 };
+
+                // Midgame guard: connected + safe = good
+                let midgame_guard_bonus = if midgame_phase && connection > 0 && risk == 0 { 120 } else { 0 };
+
+                // Quiet opening: avoid big moves with no strategic value
+                let quiet_opening_penalty = if opening_phase && connection == 0 && barrier == 0 && steal == 0 {
+                    area * 12
+                } else {
+                    0
+                };
+
+                m.priority += corner_bonus;
+                m.priority += edge_bonus;
+                m.priority += compact_bonus;
+                m.priority += connection_bonus;
+                m.priority -= risk_penalty;
+                m.priority += barrier_bonus;
+                m.priority += steal_bonus;
+                m.priority += midgame_guard_bonus;
+                m.priority -= extension_penalty;
+                m.priority -= loose_shape_penalty;
+                m.priority -= quiet_opening_penalty;
+
+                if include_static_eval {
+                    let mut rec = MoveRecord::new();
+                    board.make_move(m, &mut rec);
+                    let static_score = -evaluate(board, is_first);
+                    board.unmake_move(&rec);
+                    m.priority += static_score / 10;
+                }
+            }
+        }
+
         // ====== Alpha-Beta ======
 
         fn alpha_beta(
@@ -2297,7 +2725,7 @@ pub mod search {
             }
             NODES_SEARCHED.fetch_add(1, Ordering::Relaxed);
 
-            if depth == 0 {
+            if depth <= 0 {
                 return evaluate(board, ctx.is_first);
             }
 
@@ -2342,6 +2770,9 @@ pub mod search {
 
             if !ctx.is_first && depth <= 3 {
                 apply_second_defensive_biases(board, &mut moves, false, 0, false);
+            }
+            if ctx.is_first && depth <= 3 {
+                apply_first_defensive_biases(board, &mut moves, true, false);
             }
 
             let killers = ctx.killers;
@@ -2417,7 +2848,7 @@ pub mod search {
             let killer_history_on = std::env::var("KILLER_HISTORY")
                 .ok().and_then(|v| v.parse::<i32>().ok()).map(|v| v > 0).unwrap_or(true);
             let nullmove_on = std::env::var("NULLMOVE")
-                .ok().and_then(|v| v.parse::<i32>().ok()).map(|v| v > 0).unwrap_or(false);
+                .ok().and_then(|v| v.parse::<i32>().ok()).map(|v| v > 0).unwrap_or(true);
             let asp_window: i32 = match std::env::var("ASP_WINDOW").as_deref() {
                 Ok("0") | Ok("full") => 0,
                 Ok("adaptive") => -1,
@@ -2433,6 +2864,17 @@ pub mod search {
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(0);
             let second_steal: i32 = std::env::var("SECOND_STEAL")
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+
+            // Read matched opponent style from globals (reserved for future use)
+            let _matched_style = match G_MATCHED_STYLE.load(Ordering::Relaxed) {
+                1 => KnownStyle::CordycepsAttack,
+                2 => KnownStyle::CordycepsDefense,
+                3 => KnownStyle::CordycepsBalanced,
+                4 => KnownStyle::RustOld,
+                5 => KnownStyle::RustUpdate,
+                _ => KnownStyle::Unknown,
+            };
+            let _match_confidence = G_MATCH_CONFIDENCE.load(Ordering::Relaxed) as f32 / 100.0;
 
             advance_tt_age();
 
@@ -2453,6 +2895,7 @@ pub mod search {
             let empty_history = [[0i32; COLS]; ROWS];
             order_moves(&mut moves, &PASS_MOVE, 0, &empty_killers, &empty_history, killer_history_on);
             apply_second_root_biases(&mut work_board, &mut moves, is_first, second_steal);
+            apply_first_root_biases(&mut work_board, &mut moves, is_first);
             order_moves(&mut moves, &PASS_MOVE, 0, &empty_killers, &empty_history, killer_history_on);
 
             let mut best_move = moves[0];
@@ -2474,11 +2917,11 @@ pub mod search {
                     nullmove_ok: true,
                 };
                 let mut endgame_best = best_move;
-                alpha_beta(&mut work_board, 8, -999999, 999999, &mut ctx, &mut endgame_best);
+                alpha_beta(&mut work_board, 10, -999999, 999999, &mut ctx, &mut endgame_best);
                 if !ctx.timed_out() {
                     return SearchReport {
                         best_move: endgame_best,
-                        completed_depth: 8,
+                        completed_depth: 10,
                         nodes: NODES_SEARCHED.load(Ordering::Relaxed),
                         elapsed_ms: search_start.elapsed().as_millis() as i64,
                     };

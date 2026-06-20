@@ -9,6 +9,8 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <climits>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -433,6 +435,8 @@ private:
   KnownStyle matched_style_ = KnownStyle::UNKNOWN;
   float match_confidence_ = 0.0f;
   bool fingerprint_checked_ = false;
+  int fingerprint_check_interval_ = 3; // re-check every N opp moves
+  int last_check_move_ = 0;
 };
 
 // ====== From: opponent_db.hpp ======
@@ -528,6 +532,10 @@ extern OpponentDB g_opponent_db;
 // Active prior config (set by OpponentDB::load or defaults)
 // Used by board.cpp priority calculation
 extern const MovePriorConfig *g_active_prior_config;
+
+// Current matched opponent style (set by Protocol::handle_opp)
+extern KnownStyle g_matched_style;
+extern float g_match_confidence;
 
 // ====== From: board.cpp ======
 #include <sstream>
@@ -1490,6 +1498,22 @@ Move search_best_move(const Board &board, int time_budget_ms, bool is_first) {
       second_steal = std::atoi(ss);
   }
 
+  // Read matched opponent style for style-specific countering
+  KnownStyle matched_style = KnownStyle::UNKNOWN;
+  float match_confidence = 0.0f;
+  {
+    // Try to read from protocol state (set during handle_opp)
+    // For now, read from env or use matched_style_ from protocol
+    const char *ms = std::getenv("MATCHED_STYLE");
+    if (ms) {
+      int sv = std::atoi(ms);
+      matched_style = static_cast<KnownStyle>(sv);
+    }
+    const char *mc = std::getenv("MATCH_CONFIDENCE");
+    if (mc)
+      match_confidence = std::atof(mc) / 100.0f;
+  }
+
   // P0.3: Age-based TT â€” increment generation instead of O(N) tt_clear()
   ++tt_age; // wraps naturally on uint8_t overflow
 
@@ -1517,7 +1541,6 @@ Move search_best_move(const Board &board, int time_budget_ms, bool is_first) {
         for (int c = m.c1; c <= m.c2; ++c) {
           if (owners[r][c] != opp)
             continue;
-          // Check adjacent to live mushroom (recapturable)
           bool adj = false;
           if (r > 0 && values[r - 1][c] > 0)
             adj = true;
@@ -1531,9 +1554,9 @@ Move search_best_move(const Board &board, int time_budget_ms, bool is_first) {
             ++steal;
         }
       }
-      m.priority += steal * 30; // boost recapture moves
+      m.priority += steal * 30;
     }
-    order_moves(moves, PASS_MOVE, 0); // re-sort with steal bonus
+    order_moves(moves, PASS_MOVE, 0);
   }
 
   Move best_move = moves[0];
@@ -1696,6 +1719,8 @@ void Protocol::handle_init(const std::string &line) {
   matched_style_ = KnownStyle::UNKNOWN;
   match_confidence_ = 0.0f;
   fingerprint_checked_ = false;
+  fingerprint_check_interval_ = 3;
+  last_check_move_ = 0;
 }
 
 void Protocol::handle_time(const std::string &line) {
@@ -1794,15 +1819,40 @@ void Protocol::log_shadow_metrics() {
   default:
     break;
   }
+
+  // Compute enhanced metrics
+  float shape_entropy = 0.0f;
+  if (opp_fp_.move_count > 0) {
+    for (int i = 0; i < 8; ++i) {
+      if (opp_fp_.shape_counts[i] > 0) {
+        float p = static_cast<float>(opp_fp_.shape_counts[i]) / opp_fp_.move_count;
+        shape_entropy -= p * std::log2(p);
+      }
+    }
+  }
+  float center_focus = 0.0f;
+  {
+    int total_region = opp_fp_.region_counts[0] + opp_fp_.region_counts[1] +
+                       opp_fp_.region_counts[2] + opp_fp_.region_counts[3];
+    if (total_region > 0) {
+      center_focus = static_cast<float>(opp_fp_.region_counts[3] + opp_fp_.region_counts[2]) / total_region;
+    }
+  }
+  float steal_agg = 0.0f;
+  if (opp_fp_.move_count > 0) {
+    steal_agg = static_cast<float>(opp_fp_.steal_seen) / opp_fp_.move_count;
+  }
+
   FILE *f = std::fopen("fingerprint_shadow.log", "a");
   if (f) {
     std::fprintf(f,
                  "G%d %s moves=%d opp_moves=%d matched=%s conf=%.2f "
-                 "fv=[%d,%d,%d,%d,%d,%d,%d,%d] ply=%d\n",
+                 "fv=[%d,%d,%d,%d,%d,%d,%d,%d] ply=%d "
+                 "ent=%.2f center=%.2f steal_agg=%.2f\n",
                  game_count, side.c_str(), move_counter_, opp_move_counter_,
                  style.c_str(), match_confidence_, fv.dim[0], fv.dim[1],
                  fv.dim[2], fv.dim[3], fv.dim[4], fv.dim[5], fv.dim[6],
-                 fv.dim[7], ply_counter_);
+                 fv.dim[7], ply_counter_, shape_entropy, center_focus, steal_agg);
     std::fclose(f);
   }
 #endif
@@ -1889,25 +1939,46 @@ void Protocol::handle_opp(const std::string &line) {
   }
 
   // Try to match known fingerprint after sufficient observations
+  // Re-check periodically to improve accuracy as more data accumulates
+  bool should_check = false;
   if (!fingerprint_checked_ && opp_move_counter_ >= 5) {
+    should_check = true;
+  } else if (fingerprint_checked_ &&
+             opp_move_counter_ >= last_check_move_ + fingerprint_check_interval_ &&
+             match_confidence_ < 0.80f) {
+    should_check = true;
+  }
+
+  if (should_check) {
     auto fps = g_opponent_db.fingerprints();
     float conf = 0.0f, margin = 0.0f;
     KnownStyle style = opp_fp_.match_fingerprint(
         fps.data(), static_cast<int>(fps.size()), conf, margin);
-    if (style != KnownStyle::UNKNOWN && conf >= 0.50f) {
+    if (style != KnownStyle::UNKNOWN && conf >= 0.40f) {
+      KnownStyle old_style = matched_style_;
       matched_style_ = style;
       match_confidence_ = conf;
       fingerprint_checked_ = true;
+      last_check_move_ = opp_move_counter_;
 
-      // Select prior config based on matched fingerprint
-      for (const auto &fp : fps) {
-        if (fp.style == style) {
-          const auto *cfg = g_opponent_db.get_prior_config(fp.prior_config_id);
-          if (cfg)
-            g_active_prior_config = cfg;
-          break;
+      // Update globals for search engine
+      g_matched_style = style;
+      g_match_confidence = conf;
+
+      // Only update prior config if style changed or first match
+      if (old_style != style) {
+        // Select style-specific counter prior config
+        for (const auto &fp : fps) {
+          if (fp.style == style) {
+            const auto *cfg = g_opponent_db.get_prior_config(fp.prior_config_id);
+            if (cfg)
+              g_active_prior_config = cfg;
+            break;
+          }
         }
       }
+    } else if (fingerprint_checked_) {
+      last_check_move_ = opp_move_counter_;
     }
   }
 }
@@ -1933,6 +2004,10 @@ static const MovePriorConfig kDefaultPriorConfig = {
 const MovePriorConfig *g_active_prior_config =
     nullptr; // nullptr = NO overhead when no data.bin
 
+// Current matched opponent style (for search engine to read)
+KnownStyle g_matched_style = KnownStyle::UNKNOWN;
+float g_match_confidence = 0.0f;
+
 // === FeatureVector8 from OpponentFingerprint ===
 FeatureVector8 OpponentFingerprint::to_feature_vector() const {
   FeatureVector8 fv = {};
@@ -1946,24 +2021,27 @@ FeatureVector8 OpponentFingerprint::to_feature_vector() const {
   int tall = tall_count;
   int wide = wide_count;
 
-  // Q8.7: value * 128
-  fv.dim[0] = static_cast<int16_t>((total * 128) / n);        // avg_area
-  fv.dim[1] = static_cast<int16_t>((medium * 128) / n);       // medium_ratio
-  fv.dim[2] = static_cast<int16_t>((large * 128) / n);        // large_ratio
-  fv.dim[3] = static_cast<int16_t>((tall * 128) / n);         // portrait_ratio
-  fv.dim[4] = static_cast<int16_t>((wide * 128) / n);         // landscape_ratio
-  fv.dim[5] = static_cast<int16_t>((steal_seen * 128) / n);   // steal_ratio
-  fv.dim[6] = static_cast<int16_t>((pass_seen * 128) / n);    // pass_ratio
-  fv.dim[7] = static_cast<int16_t>((barrier_freq * 128) / n); // barrier_ratio
+  // Q8.7: value * 128, clamp to i16 range
+  auto clamped = [](int v) -> int16_t {
+    return static_cast<int16_t>(std::min(v, static_cast<int>(INT16_MAX)));
+  };
+  fv.dim[0] = clamped((total * 128) / n);        // avg_area
+  fv.dim[1] = clamped((medium * 128) / n);       // medium_ratio
+  fv.dim[2] = clamped((large * 128) / n);        // large_ratio
+  fv.dim[3] = clamped((tall * 128) / n);         // portrait_ratio
+  fv.dim[4] = clamped((wide * 128) / n);         // landscape_ratio
+  fv.dim[5] = clamped((steal_seen * 128) / n);   // steal_ratio
+  fv.dim[6] = clamped((pass_seen * 128) / n);    // pass_ratio
+  fv.dim[7] = clamped((barrier_freq * 128) / n); // barrier_ratio
 
   return fv;
 }
 
-// === Fingerprint matching (nearest-neighbor with variance weighting) ===
+// === Fingerprint matching (nearest-neighbor with enhanced distance metric) ===
 KnownStyle OpponentFingerprint::match_fingerprint(const KnownFingerprint *fps,
-                                                  int count,
-                                                  float &out_confidence,
-                                                  float &out_margin) const {
+                                                   int count,
+                                                   float &out_confidence,
+                                                   float &out_margin) const {
   out_confidence = 0.0f;
   out_margin = 0.0f;
   if (count == 0 || move_count == 0)
@@ -1974,7 +2052,10 @@ KnownStyle OpponentFingerprint::match_fingerprint(const KnownFingerprint *fps,
   float best_dist = 1e30f;
   int second_idx = -1;
   float second_dist = 1e30f;
-  (void)second_idx; // may be unused if no second candidate
+  (void)second_idx;
+
+  // Per-dimension importance weights (steal/barrier/pass more discriminative)
+  static const float DIM_WEIGHTS[8] = {0.8f, 1.0f, 1.2f, 1.0f, 1.0f, 1.5f, 1.3f, 1.4f};
 
   for (int i = 0; i < count; ++i) {
     // Check side mask
@@ -1987,14 +2068,14 @@ KnownStyle OpponentFingerprint::match_fingerprint(const KnownFingerprint *fps,
     if (move_count < fps[i].min_moves)
       continue;
 
-    // Weighted Euclidean distance
+    // Weighted Mahalanobis-inspired distance
     float dist = 0.0f;
     for (int d = 0; d < 8; ++d) {
       float diff = static_cast<float>(fv.dim[d] - fps[i].mean.dim[d]);
       float inv_var = static_cast<float>(fps[i].var.dim[d]);
       if (inv_var > 0.0f)
         diff /= (inv_var / 128.0f);
-      dist += diff * diff;
+      dist += DIM_WEIGHTS[d] * diff * diff;
     }
 
     if (dist < best_dist) {
@@ -2011,16 +2092,24 @@ KnownStyle OpponentFingerprint::match_fingerprint(const KnownFingerprint *fps,
   if (best_idx < 0)
     return KnownStyle::UNKNOWN;
 
-  // Confidence = 1.0 - (best_dist / second_dist)
-  if (second_dist < 1e29f && second_dist > 0.0f) {
+  // Confidence: ratio-based with single-match handling
+  if (second_dist < 1e29f && second_dist > 0.01f) {
     out_confidence = 1.0f - (best_dist / second_dist);
   } else {
-    out_confidence = 1.0f; // only one match
+    // Single match: only one candidate exists, no confusion possible
+    out_confidence = 0.95f;
   }
   out_margin = second_dist - best_dist;
 
-  // Apply confidence threshold
-  if (out_confidence * 100.0f < fps[best_idx].confidence_threshold) {
+  // Adaptive threshold: lower when we have more observations
+  float base_threshold = static_cast<float>(fps[best_idx].confidence_threshold);
+  float adaptive_threshold = base_threshold;
+  if (move_count >= 15)
+    adaptive_threshold = base_threshold * 0.75f;
+  else if (move_count >= 10)
+    adaptive_threshold = base_threshold * 0.85f;
+
+  if (out_confidence * 100.0f < adaptive_threshold) {
     return KnownStyle::UNKNOWN;
   }
 
