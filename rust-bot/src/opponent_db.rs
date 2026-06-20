@@ -439,6 +439,7 @@ impl OpponentFingerprint {
             3 => KnownStyle::CordycepsBalanced,
             4 => KnownStyle::RustOld,
             5 => KnownStyle::RustUpdate,
+            6 => KnownStyle::Main5Cordyceps,
             _ => KnownStyle::Unknown,
         }
     }
